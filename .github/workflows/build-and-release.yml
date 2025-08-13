@@ -1,0 +1,88 @@
+name: Build and Release
+
+on:
+  push:
+    branches: [ main, master ]
+  workflow_dispatch: {}
+  release:
+    types: [ published ]
+
+jobs:
+  build:
+    name: Build ${{ matrix.name }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      matrix:
+        include:
+          - name: linux-amd64
+            runner: ubuntu-latest
+            goos: linux
+            goarch: amd64
+          - name: windows-amd64
+            runner: windows-latest
+            goos: windows
+            goarch: amd64
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v4
+        with:
+          go-version: '1.20'
+
+      - name: Build (Linux)
+        if: matrix.goos == 'linux'
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+        run: |
+          mkdir -p build
+          OUTPUT=build/dropbox-sync-${{ matrix.goos }}-${{ matrix.goarch }}
+          echo "building $OUTPUT"
+          go build -o "$OUTPUT"
+          tar -C build -czf "$OUTPUT.tar.gz" "$(basename $OUTPUT)"
+        shell: bash
+
+      - name: Build (Windows)
+        if: matrix.goos == 'windows'
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+        run: |
+          New-Item -ItemType Directory -Force -Path build | Out-Null
+          $output = "build\\dropbox-sync-${{ matrix.goos }}-${{ matrix.goarch }}.exe"
+          Write-Host "building $output"
+          # Build binary
+          go build -o $output
+          # Zip the executable
+          $zipPath = "${{ github.workspace }}\\build\\dropbox-sync-${{ matrix.goos }}-${{ matrix.goarch }}.zip"
+          if (Test-Path $zipPath) { Remove-Item $zipPath }
+          Compress-Archive -Path $output -DestinationPath $zipPath -Force
+        shell: pwsh
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v3
+        with:
+          name: ${{ matrix.name }}
+          path: |
+            build/*.tar.gz
+            build/*.zip
+
+      - name: Upload release asset (linux)
+        if: github.event_name == 'release' && matrix.goos == 'linux'
+        uses: actions/upload-release-asset@v1
+        with:
+          upload_url: ${{ github.event.release.upload_url }}
+          asset_path: build/dropbox-sync-linux-amd64.tar.gz
+          asset_name: dropbox-sync-linux-amd64.tar.gz
+          asset_content_type: application/gzip
+
+      - name: Upload release asset (windows)
+        if: github.event_name == 'release' && matrix.goos == 'windows'
+        uses: actions/upload-release-asset@v1
+        with:
+          upload_url: ${{ github.event.release.upload_url }}
+          asset_path: build/dropbox-sync-windows-amd64.zip
+          asset_name: dropbox-sync-windows-amd64.zip
+          asset_content_type: application/zip
