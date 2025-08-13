@@ -1,0 +1,7 @@
+{
+  "access_token": "YOUR_DROPBOX_ACCESS_TOKEN",
+  "local_folder": "C:/path/to/local/folder",
+  "remote_folder": "/your/dropbox/folder",
+  "delete": true,
+  "workers": 8
+}

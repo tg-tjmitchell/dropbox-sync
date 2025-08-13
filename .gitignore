@@ -1,0 +1,45 @@
+# Binaries for programs and plugins
+*.exe
+*.dll
+*.so
+*.dylib
+
+# Output of the go coverage tool
+*.out
+
+# Build directories
+bin/
+build/
+
+# Dependency directories
+vendor/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# IDEs and editors
+.vscode/
+.idea/
+
+# Logs
+*.log
+
+# Environment and secret files
+.env
+.env.*
+secrets.json
+
+# Dropbox or runtime config — keep example files in repo, ignore real config
+dropbox-sync.json
+
+# Go specific
+# Binaries built by 'go build'
+*.exe
+
+# Go workspace
+_workspace/
+
+# Test cache and coverage
+coverage.out
+*.test

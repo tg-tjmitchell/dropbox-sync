@@ -1,0 +1,14 @@
+# Set default behavior, ensure consistent EOL and encoding
+* text=auto
+
+# Force LF for source files
+*.go text eol=lf
+*.sh text eol=lf
+
+# Mark generated files as binary
+*.exe binary
+*.dll binary
+*.so binary
+
+# Ensure JSON and other text files are normalized
+*.json text
