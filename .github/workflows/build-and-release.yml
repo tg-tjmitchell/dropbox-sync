@@ -48,7 +48,6 @@ jobs:
           OUTPUT=build/dropbox-sync-${{ matrix.goos }}-${{ matrix.goarch }}
           echo "building $OUTPUT"
           go build -o "$OUTPUT"
-          tar -C build -czf "$OUTPUT.tar.gz" "$(basename $OUTPUT)"
         shell: bash
 
       - name: Build (Windows)
@@ -62,37 +61,40 @@ jobs:
           Write-Host "building $output"
           # Build binary
           go build -o $output
-          # Zip the executable
-          $zipPath = "${{ github.workspace }}\\build\\dropbox-sync-${{ matrix.goos }}-${{ matrix.goarch }}.zip"
-          if (Test-Path $zipPath) { Remove-Item $zipPath }
-          Compress-Archive -Path $output -DestinationPath $zipPath -Force
+          # Keep only the built .exe in build/ (no zip archive created)
         shell: pwsh
 
-      - name: Upload build artifact
+      - name: Upload build artifact (linux)
+        if: matrix.goos == 'linux'
         uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.name }}
-          path: |
-            build/*.tar.gz
-            build/*.zip
+          path: build/dropbox-sync-${{ matrix.goos }}-${{ matrix.goarch }}
+
+      - name: Upload build artifact (windows)
+        if: matrix.goos == 'windows'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.name }}
+          path: build/dropbox-sync-${{ matrix.goos }}-${{ matrix.goarch }}.exe
 
       - name: Upload release asset (linux)
         if: github.event_name == 'release' && matrix.goos == 'linux'
         uses: actions/upload-release-asset@v1
         with:
           upload_url: ${{ github.event.release.upload_url }}
-          asset_path: build/dropbox-sync-linux-amd64.tar.gz
-          asset_name: dropbox-sync-linux-amd64.tar.gz
-          asset_content_type: application/gzip
+          asset_path: build/dropbox-sync-linux-amd64
+          asset_name: dropbox-sync-linux-amd64
+          asset_content_type: application/octet-stream
 
       - name: Upload release asset (windows)
         if: github.event_name == 'release' && matrix.goos == 'windows'
         uses: actions/upload-release-asset@v1
         with:
           upload_url: ${{ github.event.release.upload_url }}
-          asset_path: build/dropbox-sync-windows-amd64.zip
-          asset_name: dropbox-sync-windows-amd64.zip
-          asset_content_type: application/zip
+          asset_path: build/dropbox-sync-windows-amd64.exe
+          asset_name: dropbox-sync-windows-amd64.exe
+          asset_content_type: application/octet-stream
 
   release:
     name: Create Release
@@ -115,9 +117,10 @@ jobs:
       - name: Create GitHub Release and upload assets
         uses: softprops/action-gh-release@v1
         with:
-          # upload all built archives from the build folder
+          # upload the built binaries from the build folder plus example json
           files: |
-            build/*.tar.gz
-            build/*.zip
+            build/dropbox-sync-linux-amd64
+            build/dropbox-sync-windows-amd64.exe
+            dropbox-sync.example.json
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

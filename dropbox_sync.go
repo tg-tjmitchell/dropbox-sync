@@ -357,9 +357,7 @@ func collectRemoteEntries(client files.Client, root string) map[string]*syncRemo
 			switch e := entry.(type) {
 			case *files.FileMetadata:
 				rel := strings.TrimPrefix(e.PathDisplay, root)
-				if strings.HasPrefix(rel, "/") {
-					rel = rel[1:]
-				}
+				rel = strings.TrimPrefix(rel, "/")
 				if rel == "" {
 					continue
 				}
