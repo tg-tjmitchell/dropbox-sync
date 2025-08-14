@@ -60,6 +60,7 @@ Important flags the program accepts:
 - `-v` : Verbose logging
 - `--no-progress` : Disable the progress bar output
 - `--bar-width` : Progress bar width (characters)
+- `--simple-progress` : Force single-line simplified progress (useful in CI, logs, notebooks)
 
 Run `dropbox-sync --help` for the full list and descriptions.
 

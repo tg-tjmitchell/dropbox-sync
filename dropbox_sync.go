@@ -92,6 +92,7 @@ func main() {
 		flagDryRun     = flag.Bool("dry-run", false, "Show actions without executing")
 		flagVerbose    = flag.Bool("v", false, "Verbose logging")
 		flagNoProgBar  = flag.Bool("no-progress", false, "Disable progress bar output (auto disabled with -v)")
+		flagSimpleProg = flag.Bool("simple-progress", false, "Force simple single-line progress (helpful in notebooks/CI)")
 		flagBarWidth   = flag.Int("bar-width", 40, "Progress bar width (characters)")
 		flagMaxQPS     = flag.Int("max-qps", 10, "Max Dropbox API calls per second (0 = unlimited)")
 		flagMaxRetries = flag.Int("max-retries", 6, "Max retry attempts for transient Dropbox errors")
@@ -344,75 +345,115 @@ func main() {
 	showProgress := !*flagNoProgBar && !*flagVerbose && totalTasks > 0
 	doneCh := make(chan struct{})
 	if showProgress {
-		go func(total int, totalBytes int64, width int) {
-			startBar := time.Now()
-			ticker := time.NewTicker(200 * time.Millisecond)
-			defer ticker.Stop()
-			printed := false
-			lines := *flagWorkers + 1 // total summary + per worker lines
-			render := func(final bool) {
-				comp := atomic.LoadInt64(&completed)
-				pct := float64(comp) / float64(total)
-				if pct > 1 {
-					pct = 1
-				}
-				filled := int(pct * float64(width))
-				if filled > width {
-					filled = width
-				}
-				bar := strings.Repeat("#", filled) + strings.Repeat("-", width-filled)
-				elapsed := time.Since(startBar)
-				rate := float64(comp) / maxFloat(elapsed.Seconds(), 0.001)
-				bytesNow := atomic.LoadInt64(&bytesDone)
-				uNow := atomic.LoadInt64(&bytesUploaded)
-				dNow := atomic.LoadInt64(&bytesDownloaded)
-				totalRate := humanRate(float64(bytesNow) / maxFloat(elapsed.Seconds(), 0.001))
-				upRate := humanRate(float64(uNow) / maxFloat(elapsed.Seconds(), 0.001))
-				downRate := humanRate(float64(dNow) / maxFloat(elapsed.Seconds(), 0.001))
-				var etaStr string
-				if comp > 0 && comp < int64(total) {
-					remaining := float64(int64(total)-comp) / rate
-					etaStr = formatDuration(time.Duration(remaining * float64(time.Second)))
-				} else {
-					etaStr = "0s"
-				}
-				if printed {
-					// move cursor up to redraw block
-					fmt.Printf("\033[%dA", lines)
-				} else {
-					printed = true
-				}
-				// Summary line
-				fmt.Printf("[%s] %5.1f%% %d/%d | %s/%s U:%s(%s) D:%s(%s) | %s | ETA %s Elap %s\n",
-					bar, pct*100, comp, total, humanBytes(bytesNow), humanBytes(totalBytes), humanBytes(uNow), upRate, humanBytes(dNow), downRate, totalRate, etaStr, formatDuration(elapsed))
-				// Per-worker lines
-				for i, st := range perWorker {
-					u := atomic.LoadInt64(&st.uploaded)
-					dl := atomic.LoadInt64(&st.downloaded)
-					tsks := atomic.LoadInt64(&st.tasks)
-					cur := ""
-					if v := st.current.Load(); v != nil {
-						cur, _ = v.(string)
+		useSimple := *flagSimpleProg || !isTerminal(os.Stdout)
+		if !useSimple { // fancy multi-line TTY progress
+			go func(total int, totalBytes int64, width int) {
+				startBar := time.Now()
+				ticker := time.NewTicker(200 * time.Millisecond)
+				defer ticker.Stop()
+				printed := false
+				lines := *flagWorkers + 1 // total summary + per worker lines
+				render := func(final bool) {
+					comp := atomic.LoadInt64(&completed)
+					pct := float64(comp) / float64(total)
+					if pct > 1 {
+						pct = 1
 					}
-					if len(cur) > 50 {
-						cur = cur[:47] + "..."
+					filled := int(pct * float64(width))
+					if filled > width {
+						filled = width
 					}
-					fmt.Printf(" W%02d | T:%3d U:%8s D:%8s | %s\n", i+1, tsks, humanBytes(u), humanBytes(dl), cur)
+					bar := strings.Repeat("#", filled) + strings.Repeat("-", width-filled)
+					elapsed := time.Since(startBar)
+					rate := float64(comp) / maxFloat(elapsed.Seconds(), 0.001)
+					bytesNow := atomic.LoadInt64(&bytesDone)
+					uNow := atomic.LoadInt64(&bytesUploaded)
+					dNow := atomic.LoadInt64(&bytesDownloaded)
+					totalRate := humanRate(float64(bytesNow) / maxFloat(elapsed.Seconds(), 0.001))
+					upRate := humanRate(float64(uNow) / maxFloat(elapsed.Seconds(), 0.001))
+					downRate := humanRate(float64(dNow) / maxFloat(elapsed.Seconds(), 0.001))
+					var etaStr string
+					if comp > 0 && comp < int64(total) {
+						remaining := float64(int64(total)-comp) / rate
+						etaStr = formatDuration(time.Duration(remaining * float64(time.Second)))
+					} else {
+						etaStr = "0s"
+					}
+					if printed {
+						// move cursor up to redraw block
+						fmt.Printf("\033[%dA", lines)
+					} else {
+						printed = true
+					}
+					// Summary line
+					fmt.Printf("[%s] %5.1f%% %d/%d | %s/%s U:%s(%s) D:%s(%s) | %s | ETA %s Elap %s\n",
+						bar, pct*100, comp, total, humanBytes(bytesNow), humanBytes(totalBytes), humanBytes(uNow), upRate, humanBytes(dNow), downRate, totalRate, etaStr, formatDuration(elapsed))
+					// Per-worker lines
+					for i, st := range perWorker {
+						u := atomic.LoadInt64(&st.uploaded)
+						dl := atomic.LoadInt64(&st.downloaded)
+						tsks := atomic.LoadInt64(&st.tasks)
+						cur := ""
+						if v := st.current.Load(); v != nil {
+							cur, _ = v.(string)
+						}
+						if len(cur) > 50 {
+							cur = cur[:47] + "..."
+						}
+						fmt.Printf(" W%02d | T:%3d U:%8s D:%8s | %s\n", i+1, tsks, humanBytes(u), humanBytes(dl), cur)
+					}
+					if final {
+						fmt.Print("\033[0m")
+					}
 				}
-				if final {
-					fmt.Print("\033[0m")
+				for {
+					select {
+					case <-doneCh:
+						render(true)
+						return
+					case <-ticker.C:
+						render(false)
+					}
 				}
-			}
-			for {
-				select {
-				case <-doneCh:
-					render(true)
-					return
-				case <-ticker.C:
-					render(false)
+			}(totalTasks, totalBytes, *flagBarWidth)
+		} else { // simple single-line fallback (e.g., Jupyter)
+			go func(total int, totalBytes int64) {
+				startBar := time.Now()
+				ticker := time.NewTicker(500 * time.Millisecond)
+				defer ticker.Stop()
+				render := func(final bool) {
+					comp := atomic.LoadInt64(&completed)
+					pct := float64(comp) / maxFloat(float64(total), 1)
+					if pct > 1 {
+						pct = 1
+					}
+					elapsed := time.Since(startBar)
+					bytesNow := atomic.LoadInt64(&bytesDone)
+					uNow := atomic.LoadInt64(&bytesUploaded)
+					dNow := atomic.LoadInt64(&bytesDownloaded)
+					var etaStr string
+					if comp > 0 && comp < int64(total) {
+						r := float64(int64(total)-comp) / (float64(comp) / maxFloat(elapsed.Seconds(), 0.001))
+						etaStr = formatDuration(time.Duration(r * float64(time.Second)))
+					} else {
+						etaStr = "0s"
+					}
+					fmt.Printf("\r%5.1f%% %d/%d | %s/%s U:%s D:%s ETA %s Elap %s        ", pct*100, comp, total, humanBytes(bytesNow), humanBytes(totalBytes), humanBytes(uNow), humanBytes(dNow), etaStr, formatDuration(elapsed))
+					if final {
+						fmt.Print("\n")
+					}
 				}
-			}
-		}(totalTasks, totalBytes, *flagBarWidth)
+				for {
+					select {
+					case <-doneCh:
+						render(true)
+						return
+					case <-ticker.C:
+						render(false)
+					}
+				}
+			}(totalTasks, totalBytes)
+		}
 	}
 
 	worker := func(id int) {
@@ -882,6 +923,25 @@ var (
 	verbose       bool
 	retryDebug    bool // enables retry attempt logging (set by -v or DBSYNC_DEBUG_RETRIES=1)
 )
+
+// isTerminal provides a lightweight TTY detection; returns false for likely notebook environments.
+func isTerminal(f *os.File) bool {
+	if f == nil {
+		return false
+	}
+	fi, err := f.Stat()
+	if err != nil {
+		return false
+	}
+	if (fi.Mode() & os.ModeCharDevice) == 0 { // not a char device
+		return false
+	}
+	// Common notebook indicators; if set, disable fancy progress.
+	if os.Getenv("JPY_PARENT_PID") != "" || os.Getenv("IPYTHON_KERNEL") != "" || os.Getenv("COLAB_GPU") != "" {
+		return false
+	}
+	return true
+}
 
 // Initialize limiter & retry settings once main has parsed flags.
 func init() {
