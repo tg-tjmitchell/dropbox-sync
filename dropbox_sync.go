@@ -87,6 +87,9 @@ func main() {
 	)
 	flag.Parse()
 	// Resolve configuration order: flags > env vars > config file
+	// Added flag for automatic remote folder creation when missing
+	flagAutoCreate := flag.Bool("auto-create-remote", true, "Automatically create remote Dropbox folder path if missing")
+
 	token := firstNonEmpty(*flagToken,
 		os.Getenv("DBSYNC_ACCESS_TOKEN"),
 		os.Getenv("DROPBOX_ACCESS_TOKEN"))
@@ -171,7 +174,19 @@ func main() {
 	fmt.Println("Listing remote files (with pagination)...")
 	remoteFiles, remErr := collectRemoteEntries(client, *flagRemote)
 	if remErr != nil {
-		log.Fatalf("remote listing failed: %v", remErr)
+		if isPathNotFound(remErr) && *flagAutoCreate {
+			if *flagVerbose {
+				fmt.Printf("Remote folder %s missing; attempting to create...\n", *flagRemote)
+			}
+			if err := ensureRemoteFolderExists(client, *flagRemote, *flagVerbose); err != nil {
+				log.Fatalf("remote listing failed (auto-create attempt failed): %v", err)
+			}
+			// Retry listing after creation
+			remoteFiles, remErr = collectRemoteEntries(client, *flagRemote)
+		}
+		if remErr != nil {
+			log.Fatalf("remote listing failed: %v", remErr)
+		}
 	}
 	fmt.Printf("Found %d remote files.\n", len(remoteFiles))
 
@@ -502,6 +517,49 @@ func isAuthError(err error) bool {
 		strings.Contains(msg, "invalid_access_token") ||
 		strings.Contains(msg, "invalid_client") ||
 		strings.Contains(msg, "auth") && strings.Contains(msg, "error")
+}
+
+// isPathNotFound detects Dropbox path/not_found style errors
+func isPathNotFound(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "path/not_found") || strings.Contains(msg, "path_lookup/") && strings.Contains(msg, "not_found")
+}
+
+// ensureRemoteFolderExists attempts to create the remote folder path hierarchy.
+// Dropbox CreateFolderV2 only creates the final segment; intermediate segments
+// must also exist. We create each segment iteratively, ignoring 'conflict' errors.
+func ensureRemoteFolderExists(client files.Client, fullPath string, verbose bool) error {
+	fullPath = strings.TrimRight(fullPath, "/")
+	if fullPath == "" || fullPath == "/" {
+		return nil
+	}
+	// Split into cumulative segments
+	parts := strings.Split(strings.TrimPrefix(fullPath, "/"), "/")
+	var builder strings.Builder
+	for i, p := range parts {
+		builder.WriteString("/")
+		builder.WriteString(p)
+		seg := builder.String()
+		arg := files.NewCreateFolderArg(seg)
+		// Create, ignoring errors that indicate it already exists
+		_, err := client.CreateFolderV2(arg)
+		if err != nil {
+			low := strings.ToLower(err.Error())
+			if strings.Contains(low, "conflict") || strings.Contains(low, "already") {
+				// exists - continue
+			} else if isPathNotFound(err) && i < len(parts)-1 {
+				// Parent missing - attempt to continue (shouldn't typically occur due to iteration)
+			} else {
+				return fmt.Errorf("create folder %s: %w", seg, err)
+			}
+		} else if verbose {
+			fmt.Printf("Created remote folder: %s\n", seg)
+		}
+	}
+	return nil
 }
 
 // loadConfigFile parses JSON config file.
