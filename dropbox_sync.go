@@ -8,7 +8,6 @@ import (
 	"fmt"
 	"io"
 	"log"
-	"net/http"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -165,15 +164,6 @@ func main() {
 	}
 
 	config := dropbox.Config{Token: token}
-	// Tune HTTP client for higher concurrency & many small uploads
-	config.Client = &http.Client{
-		Transport: &http.Transport{
-			MaxIdleConns:        512,
-			MaxIdleConnsPerHost: 512,
-			IdleConnTimeout:     90 * time.Second,
-		},
-		Timeout: 0, // allow long running large uploads without client timeout
-	}
 	client := files.New(config)
 
 	start := time.Now()
@@ -275,26 +265,6 @@ func main() {
 		fmt.Printf("Uploads disabled by mode (%s)\n", *flagMode)
 	} else {
 		fmt.Printf("Planned uploads/updates: %d\n", len(uploads))
-	}
-
-	// Adaptive worker scaling for predominately tiny files (if user did not explicitly set --workers)
-	if !flagPassed("workers") && len(uploads) > 0 {
-		var smallCnt int
-		for _, u := range uploads {
-			if u.Size < 64*1024 { // <64KB considered tiny
-				smallCnt++
-			}
-		}
-		if smallCnt*100/len(uploads) >= 70 { // 70%+ tiny
-			// Scale up to min(64, max(current, NumCPU()*6))
-			target := minInt(64, maxInt(*flagWorkers, runtime.NumCPU()*6))
-			if target > *flagWorkers {
-				if *flagVerbose {
-					fmt.Printf("Auto-scaling workers from %d to %d for many small files\n", *flagWorkers, target)
-				}
-				*flagWorkers = target
-			}
-		}
 	}
 	if *flagDelete {
 		fmt.Printf("Planned deletions: %d\n", len(deletes))
@@ -467,13 +437,6 @@ func main() {
 
 func minInt(a, b int) int {
 	if a < b {
-		return a
-	}
-	return b
-}
-
-func maxInt(a, b int) int {
-	if a > b {
 		return a
 	}
 	return b
@@ -661,8 +624,12 @@ func uploadFile(client files.Client, remoteRoot string, lf *syncLocalFile, progr
 	upArg.Mute = true
 
 	if lf.Size <= largeFileThreshold {
-		// Stream small file directly; avoids allocation & extra copy
-		_, err = client.Upload(upArg, f)
+		// Wrap reader to count bytes (single increment at end if small)
+		data, errRead := io.ReadAll(f)
+		if errRead != nil {
+			return errRead
+		}
+		_, err = client.Upload(upArg, bytes.NewReader(data))
 		if err == nil && progress != nil {
 			progress(lf.Size)
 		}
@@ -685,18 +652,13 @@ func uploadFile(client files.Client, remoteRoot string, lf *syncLocalFile, progr
 	}
 
 	offset := int64(n)
-	// Buffer pool for subsequent chunks to reduce allocations
-	var bufPool = sync.Pool{New: func() any { return make([]byte, chunkSize) }}
 	for offset < lf.Size {
 		remaining := lf.Size - offset
 		thisChunk := int64(chunkSize)
 		if remaining < thisChunk {
 			thisChunk = remaining
 		}
-		buf := bufPool.Get().([]byte)
-		if int64(len(buf)) > thisChunk {
-			buf = buf[:thisChunk]
-		}
+		buf := make([]byte, thisChunk)
 		rn, err := io.ReadFull(f, buf)
 		if err != nil && !errors.Is(err, io.ErrUnexpectedEOF) {
 			return fmt.Errorf("read chunk: %w", err)
@@ -712,12 +674,6 @@ func uploadFile(client files.Client, remoteRoot string, lf *syncLocalFile, progr
 			if progress != nil {
 				progress(int64(rn))
 			}
-			// reset slice length before putting back
-			if cap(buf) >= chunkSize {
-				bufPool.Put(buf[:chunkSize])
-			} else {
-				bufPool.Put(buf)
-			}
 		} else { // finish
 			commitInfo := files.NewCommitInfo(remotePath)
 			commitInfo.ClientModified = &lf.MTime
@@ -730,7 +686,6 @@ func uploadFile(client files.Client, remoteRoot string, lf *syncLocalFile, progr
 			if progress != nil {
 				progress(int64(rn))
 			}
-			// final buffer not reused
 		}
 	}
 	return nil
