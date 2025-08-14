@@ -169,7 +169,10 @@ func main() {
 	fmt.Printf("Found %d local files.\n", len(localFiles))
 
 	fmt.Println("Listing remote files (with pagination)...")
-	remoteFiles := collectRemoteEntries(client, *flagRemote)
+	remoteFiles, remErr := collectRemoteEntries(client, *flagRemote)
+	if remErr != nil {
+		log.Fatalf("remote listing failed: %v", remErr)
+	}
 	fmt.Printf("Found %d remote files.\n", len(remoteFiles))
 
 	// Apply mode (if provided) to normalize delete/download flags and decide if uploads are skipped
@@ -450,14 +453,17 @@ func collectLocalEntries(root string) map[string]*syncLocalFile {
 }
 
 // collectRemoteEntries retrieves remote recursive listing.
-func collectRemoteEntries(client files.Client, root string) map[string]*syncRemoteFile {
+func collectRemoteEntries(client files.Client, root string) (map[string]*syncRemoteFile, error) {
 	out := make(map[string]*syncRemoteFile)
 	arg := files.NewListFolderArg(root)
 	arg.Recursive = true
 	res, err := client.ListFolder(arg)
 	if err != nil {
-		fmt.Println("Warning: remote listing failed (treating as empty):", err)
-		return out
+		if isAuthError(err) {
+			return out, fmt.Errorf("authentication/authorization error: %w", err)
+		}
+		// Non-auth errors: return empty with wrapped error so caller can decide.
+		return out, fmt.Errorf("list folder: %w", err)
 	}
 	process := func(entries []files.IsMetadata) {
 		for _, entry := range entries {
@@ -476,12 +482,26 @@ func collectRemoteEntries(client files.Client, root string) map[string]*syncRemo
 	for res.HasMore {
 		res, err = client.ListFolderContinue(files.NewListFolderContinueArg(res.Cursor))
 		if err != nil {
-			fmt.Println("Error during pagination:", err)
-			break
+			if isAuthError(err) {
+				return out, fmt.Errorf("authentication/authorization error during pagination: %w", err)
+			}
+			return out, fmt.Errorf("pagination error: %w", err)
 		}
 		process(res.Entries)
 	}
-	return out
+	return out, nil
+}
+
+// isAuthError performs a simple substring check for common Dropbox auth failures.
+func isAuthError(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "expired_access_token") ||
+		strings.Contains(msg, "invalid_access_token") ||
+		strings.Contains(msg, "invalid_client") ||
+		strings.Contains(msg, "auth") && strings.Contains(msg, "error")
 }
 
 // loadConfigFile parses JSON config file.
