@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"math/rand"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -70,6 +71,96 @@ type configFileModel struct {
 	Workers      *int    `json:"workers,omitempty"`
 }
 
+// global verbosity & rate limiter
+var globalVerbose bool
+
+// simpleRateLimiter implements a very light token spacing (one token every interval).
+type simpleRateLimiter struct {
+	interval int64 // nanoseconds between requests
+	last     int64 // atomic
+}
+
+func newSimpleRateLimiter(rps int) *simpleRateLimiter {
+	if rps <= 0 {
+		return nil
+	}
+	return &simpleRateLimiter{interval: int64(time.Second) / int64(rps)}
+}
+
+func (rl *simpleRateLimiter) Wait() {
+	if rl == nil || rl.interval <= 0 {
+		return
+	}
+	for {
+		prev := atomic.LoadInt64(&rl.last)
+		now := time.Now().UnixNano()
+		if prev == 0 {
+			if atomic.CompareAndSwapInt64(&rl.last, prev, now) {
+				return
+			}
+			continue
+		}
+		waitUntil := prev + rl.interval
+		if now < waitUntil {
+			time.Sleep(time.Duration(waitUntil - now))
+			now = time.Now().UnixNano()
+		}
+		if atomic.CompareAndSwapInt64(&rl.last, prev, now) {
+			return
+		}
+	}
+}
+
+// withRetry wraps an operation with exponential backoff + jitter for transient errors.
+func withRetry(opName string, maxAttempts int, baseDelay, maxDelay time.Duration, rateLimiter *simpleRateLimiter, fn func() error) error {
+	if maxAttempts < 1 {
+		maxAttempts = 1
+	}
+	for attempt := 1; attempt <= maxAttempts; attempt++ {
+		if rateLimiter != nil {
+			rateLimiter.Wait()
+		}
+		err := fn()
+		if err == nil {
+			return nil
+		}
+		if !isRetryableTransient(err) || attempt == maxAttempts {
+			return err
+		}
+		delay := baseDelay * time.Duration(1<<(attempt-1))
+		if delay > maxDelay {
+			delay = maxDelay
+		}
+		// jitter +/- 20%
+		jitterRange := int64(delay) / 5
+		if jitterRange > 0 {
+			j := rand.Int63n(jitterRange) - jitterRange/2
+			delay = time.Duration(int64(delay) + j)
+		}
+		if globalVerbose {
+			fmt.Printf("Retrying %s after error: %v (attempt %d/%d, sleep %s)\n", opName, err, attempt, maxAttempts, delay)
+		}
+		time.Sleep(delay)
+	}
+	return nil
+}
+
+// isRetryableTransient determines if an error is likely transient/rate-limited.
+func isRetryableTransient(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	if strings.Contains(msg, "too_many_requests") || strings.Contains(msg, "rate_limit") || strings.Contains(msg, "retry") || strings.Contains(msg, "temporarily_unavailable") || strings.Contains(msg, "timeout") || strings.Contains(msg, "timed out") || strings.Contains(msg, "connection reset") || strings.Contains(msg, "connection refused") || strings.Contains(msg, "network") || strings.Contains(msg, "503") || strings.Contains(msg, "500") {
+		// filter out permanent path/conflict errors
+		if strings.Contains(msg, "path/conflict") || strings.Contains(msg, "invalid_access_token") || strings.Contains(msg, "insufficient_space") {
+			return false
+		}
+		return true
+	}
+	return false
+}
+
 func main() {
 	// --- Flags & Configuration ---
 	var (
@@ -81,6 +172,7 @@ func main() {
 		flagDownload  = flag.Bool("download", false, "Download remote files missing locally or where remote copy is newer")
 		flagMode      = flag.String("mode", "", "Sync mode: upload|download|two-way|mirror (overrides --delete/--download)")
 		flagWorkers   = flag.Int("workers", minInt(8, runtime.NumCPU()*2), "Parallel worker count")
+		flagMaxRPS    = flag.Int("max-rps", 0, "Optional max Dropbox API requests per second (0=unlimited)")
 		flagDryRun    = flag.Bool("dry-run", false, "Show actions without executing")
 		flagVerbose   = flag.Bool("v", false, "Verbose logging")
 		flagNoProgBar = flag.Bool("no-progress", false, "Disable progress bar output (auto disabled with -v)")
@@ -176,23 +268,27 @@ func main() {
 	}
 	client := files.New(config)
 
+	globalVerbose = *flagVerbose
+	rand.Seed(time.Now().UnixNano())
+	rateLimiter := newSimpleRateLimiter(*flagMaxRPS)
+
 	start := time.Now()
 	fmt.Println("Listing local files...")
 	localFiles := collectLocalEntries(*flagLocal)
 	fmt.Printf("Found %d local files.\n", len(localFiles))
 
 	fmt.Println("Listing remote files (with pagination)...")
-	remoteFiles, remErr := collectRemoteEntries(client, *flagRemote)
+	remoteFiles, remErr := collectRemoteEntries(client, *flagRemote, rateLimiter)
 	if remErr != nil {
 		if isPathNotFound(remErr) && *flagAutoCreate {
 			if *flagVerbose {
 				fmt.Printf("Remote folder %s missing; attempting to create...\n", *flagRemote)
 			}
-			if err := ensureRemoteFolderExists(client, *flagRemote, *flagVerbose); err != nil {
+			if err := ensureRemoteFolderExists(client, *flagRemote, *flagVerbose, rateLimiter); err != nil {
 				log.Fatalf("remote listing failed (auto-create attempt failed): %v", err)
 			}
 			// Retry listing after creation
-			remoteFiles, remErr = collectRemoteEntries(client, *flagRemote)
+			remoteFiles, remErr = collectRemoteEntries(client, *flagRemote, rateLimiter)
 		}
 		if remErr != nil {
 			log.Fatalf("remote listing failed: %v", remErr)
@@ -397,7 +493,7 @@ func main() {
 					if delta > 0 {
 						atomic.AddInt64(&bytesDone, delta)
 					}
-				}); err != nil {
+				}, rateLimiter); err != nil {
 					mu.Lock()
 					errorsFound = append(errorsFound, fmt.Errorf("upload %s: %w", t.Local.RelPath, err))
 					mu.Unlock()
@@ -406,7 +502,7 @@ func main() {
 				if *flagVerbose {
 					fmt.Printf("[worker %d] deleting %s\n", id, t.RemotePath)
 				}
-				if err := deleteFile(client, t.RemotePath); err != nil {
+				if err := deleteFile(client, t.RemotePath, rateLimiter); err != nil {
 					mu.Lock()
 					errorsFound = append(errorsFound, fmt.Errorf("delete %s: %w", t.RemotePath, err))
 					mu.Unlock()
@@ -419,7 +515,7 @@ func main() {
 					if delta > 0 {
 						atomic.AddInt64(&bytesDone, delta)
 					}
-				}); err != nil {
+				}, rateLimiter); err != nil {
 					mu.Lock()
 					errorsFound = append(errorsFound, fmt.Errorf("download %s: %w", t.Rel, err))
 					mu.Unlock()
@@ -505,11 +601,16 @@ func collectLocalEntries(root string) map[string]*syncLocalFile {
 }
 
 // collectRemoteEntries retrieves remote recursive listing.
-func collectRemoteEntries(client files.Client, root string) (map[string]*syncRemoteFile, error) {
+func collectRemoteEntries(client files.Client, root string, rl *simpleRateLimiter) (map[string]*syncRemoteFile, error) {
 	out := make(map[string]*syncRemoteFile)
 	arg := files.NewListFolderArg(root)
 	arg.Recursive = true
-	res, err := client.ListFolder(arg)
+	var res *files.ListFolderResult
+	var err error
+	err = withRetry("ListFolder", 6, 200*time.Millisecond, 8*time.Second, rl, func() error {
+		res, err = client.ListFolder(arg)
+		return err
+	})
 	if err != nil {
 		if isAuthError(err) {
 			return out, fmt.Errorf("authentication/authorization error: %w", err)
@@ -532,7 +633,11 @@ func collectRemoteEntries(client files.Client, root string) (map[string]*syncRem
 	}
 	process(res.Entries)
 	for res.HasMore {
-		res, err = client.ListFolderContinue(files.NewListFolderContinueArg(res.Cursor))
+		cursor := res.Cursor
+		err = withRetry("ListFolderContinue", 6, 200*time.Millisecond, 8*time.Second, rl, func() error {
+			res, err = client.ListFolderContinue(files.NewListFolderContinueArg(cursor))
+			return err
+		})
 		if err != nil {
 			if isAuthError(err) {
 				return out, fmt.Errorf("authentication/authorization error during pagination: %w", err)
@@ -568,7 +673,7 @@ func isPathNotFound(err error) bool {
 // ensureRemoteFolderExists attempts to create the remote folder path hierarchy.
 // Dropbox CreateFolderV2 only creates the final segment; intermediate segments
 // must also exist. We create each segment iteratively, ignoring 'conflict' errors.
-func ensureRemoteFolderExists(client files.Client, fullPath string, verbose bool) error {
+func ensureRemoteFolderExists(client files.Client, fullPath string, verbose bool, rl *simpleRateLimiter) error {
 	fullPath = strings.TrimRight(fullPath, "/")
 	if fullPath == "" || fullPath == "/" {
 		return nil
@@ -582,7 +687,14 @@ func ensureRemoteFolderExists(client files.Client, fullPath string, verbose bool
 		seg := builder.String()
 		arg := files.NewCreateFolderArg(seg)
 		// Create, ignoring errors that indicate it already exists
-		_, err := client.CreateFolderV2(arg)
+		var err error
+		callErr := withRetry("CreateFolderV2", 5, 150*time.Millisecond, 4*time.Second, rl, func() error {
+			_, err = client.CreateFolderV2(arg)
+			return err
+		})
+		if callErr != nil {
+			err = callErr
+		}
 		if err != nil {
 			low := strings.ToLower(err.Error())
 			if strings.Contains(low, "conflict") || strings.Contains(low, "already") {
@@ -641,7 +753,7 @@ func joinDropboxPath(root, rel string) string {
 }
 
 // uploadFile handles small and large uploads, preserving mtime
-func uploadFile(client files.Client, remoteRoot string, lf *syncLocalFile, progress func(delta int64)) error {
+func uploadFile(client files.Client, remoteRoot string, lf *syncLocalFile, progress func(delta int64), rl *simpleRateLimiter) error {
 	remotePath := joinDropboxPath(remoteRoot, lf.RelPath)
 	f, err := os.Open(lf.FullPath)
 	if err != nil {
@@ -662,7 +774,13 @@ func uploadFile(client files.Client, remoteRoot string, lf *syncLocalFile, progr
 
 	if lf.Size <= largeFileThreshold {
 		// Stream small file directly; avoids allocation & extra copy
-		_, err = client.Upload(upArg, f)
+		callErr := withRetry("UploadSmall", 5, 150*time.Millisecond, 6*time.Second, rl, func() error {
+			_, err = client.Upload(upArg, f)
+			return err
+		})
+		if callErr != nil {
+			return callErr
+		}
 		if err == nil && progress != nil {
 			progress(lf.Size)
 		}
@@ -676,7 +794,14 @@ func uploadFile(client files.Client, remoteRoot string, lf *syncLocalFile, progr
 		return fmt.Errorf("read first chunk: %w", err)
 	}
 	startArg := files.NewUploadSessionStartArg()
-	startRes, err := client.UploadSessionStart(startArg, bytes.NewReader(firstChunk[:n]))
+	var startRes *files.UploadSessionStartResult
+	callErr := withRetry("UploadSessionStart", 6, 200*time.Millisecond, 8*time.Second, rl, func() error {
+		startRes, err = client.UploadSessionStart(startArg, bytes.NewReader(firstChunk[:n]))
+		return err
+	})
+	if callErr != nil {
+		return fmt.Errorf("session start: %w", callErr)
+	}
 	if err != nil {
 		return fmt.Errorf("session start: %w", err)
 	}
@@ -685,15 +810,16 @@ func uploadFile(client files.Client, remoteRoot string, lf *syncLocalFile, progr
 	}
 
 	offset := int64(n)
-	// Buffer pool for subsequent chunks to reduce allocations
-	var bufPool = sync.Pool{New: func() any { return make([]byte, chunkSize) }}
+	// Buffer pool for subsequent chunks to reduce allocations (store pointer to slice per staticcheck advice)
+	var bufPool = sync.Pool{New: func() any { b := make([]byte, chunkSize); return &b }}
 	for offset < lf.Size {
 		remaining := lf.Size - offset
 		thisChunk := int64(chunkSize)
 		if remaining < thisChunk {
 			thisChunk = remaining
 		}
-		buf := bufPool.Get().([]byte)
+		bufp := bufPool.Get().(*[]byte)
+		buf := *bufp
 		if int64(len(buf)) > thisChunk {
 			buf = buf[:thisChunk]
 		}
@@ -705,7 +831,13 @@ func uploadFile(client files.Client, remoteRoot string, lf *syncLocalFile, progr
 		cursor := files.NewUploadSessionCursor(startRes.SessionId, uint64(offset-int64(rn)))
 		if offset < lf.Size { // append
 			appendArg := files.NewUploadSessionAppendArg(cursor)
-			err = client.UploadSessionAppendV2(appendArg, bytes.NewReader(buf[:rn]))
+			callErr := withRetry("UploadSessionAppend", 6, 200*time.Millisecond, 8*time.Second, rl, func() error {
+				err = client.UploadSessionAppendV2(appendArg, bytes.NewReader(buf[:rn]))
+				return err
+			})
+			if callErr != nil {
+				return fmt.Errorf("session append: %w", callErr)
+			}
 			if err != nil {
 				return fmt.Errorf("session append: %w", err)
 			}
@@ -713,34 +845,49 @@ func uploadFile(client files.Client, remoteRoot string, lf *syncLocalFile, progr
 				progress(int64(rn))
 			}
 			// reset slice length before putting back
-			if cap(buf) >= chunkSize {
-				bufPool.Put(buf[:chunkSize])
-			} else {
-				bufPool.Put(buf)
-			}
+			// restore full slice length before putting back
+			full := *bufp
+			full = full[:chunkSize]
+			*bufp = full
+			bufPool.Put(bufp)
 		} else { // finish
 			commitInfo := files.NewCommitInfo(remotePath)
 			commitInfo.ClientModified = &lf.MTime
 			commitInfo.Mode = &files.WriteMode{Tagged: dropbox.Tagged{Tag: "overwrite"}}
 			finishArg := files.NewUploadSessionFinishArg(cursor, commitInfo)
-			_, err = client.UploadSessionFinish(finishArg, bytes.NewReader(buf[:rn]))
+			callErr := withRetry("UploadSessionFinish", 6, 200*time.Millisecond, 12*time.Second, rl, func() error {
+				_, err = client.UploadSessionFinish(finishArg, bytes.NewReader(buf[:rn]))
+				return err
+			})
+			if callErr != nil {
+				return fmt.Errorf("session finish: %w", callErr)
+			}
 			if err != nil {
 				return fmt.Errorf("session finish: %w", err)
 			}
 			if progress != nil {
 				progress(int64(rn))
 			}
-			// final buffer not reused
+			// final buffer not reused; let GC reclaim
 		}
 	}
 	return nil
 }
 
 // downloadFile downloads a remote file to the local root preserving modified time.
-func downloadFile(client files.Client, remotePath string, localRoot string, rel string, rf *syncRemoteFile, progress func(delta int64)) error {
+func downloadFile(client files.Client, remotePath string, localRoot string, rel string, rf *syncRemoteFile, progress func(delta int64), rl *simpleRateLimiter) error {
 	// Use Download API
 	arg := files.NewDownloadArg(remotePath)
-	res, content, err := client.Download(arg)
+	var res *files.FileMetadata
+	var content io.ReadCloser
+	var err error
+	callErr := withRetry("Download", 6, 150*time.Millisecond, 6*time.Second, rl, func() error {
+		res, content, err = client.Download(arg)
+		return err
+	})
+	if callErr != nil {
+		return callErr
+	}
 	if err != nil {
 		return err
 	}
@@ -793,8 +940,15 @@ func downloadFile(client files.Client, remotePath string, localRoot string, rel 
 }
 
 // deleteFile deletes a single remote path
-func deleteFile(client files.Client, dropboxPath string) error {
-	_, err := client.DeleteV2(files.NewDeleteArg(dropboxPath))
+func deleteFile(client files.Client, dropboxPath string, rl *simpleRateLimiter) error {
+	var err error
+	callErr := withRetry("Delete", 5, 150*time.Millisecond, 4*time.Second, rl, func() error {
+		_, err = client.DeleteV2(files.NewDeleteArg(dropboxPath))
+		return err
+	})
+	if callErr != nil {
+		return callErr
+	}
 	return err
 }
 
