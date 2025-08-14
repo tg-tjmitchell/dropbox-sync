@@ -186,8 +186,6 @@ func main() {
 	token := firstNonEmpty(*flagToken,
 		os.Getenv("DBSYNC_ACCESS_TOKEN"),
 		os.Getenv("DROPBOX_ACCESS_TOKEN"))
-	// Sanitize common user-provided forms (e.g. with Bearer prefix or quotes)
-	token = sanitizeToken(token)
 
 	// If any core pieces missing, attempt config file.
 	if (token == "" || *flagLocal == "" || *flagRemote == "") && *flagConfig != "" {
@@ -575,18 +573,6 @@ func maxInt(a, b int) int {
 		return a
 	}
 	return b
-}
-
-// sanitizeToken strips common accidental prefixes or quotes from a token.
-func sanitizeToken(t string) string {
-	t = strings.TrimSpace(t)
-	t = strings.Trim(t, "\"'")
-	t = strings.TrimSpace(t)
-	// Remove leading Bearer if the user pasted header form
-	if strings.HasPrefix(strings.ToLower(t), "bearer ") {
-		return strings.TrimSpace(t[7:])
-	}
-	return t
 }
 
 // collectLocalEntries walks the local tree.
