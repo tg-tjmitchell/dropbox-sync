@@ -93,6 +93,12 @@ func main() {
 	// Added flag for automatic remote folder creation when missing
 	flagAutoCreate := flag.Bool("auto-create-remote", true, "Automatically create remote Dropbox folder path if missing")
 
+	// propagate verbosity into globals after parsing (retryDebug also from env var)
+	verbose = *flagVerbose
+	if verbose || os.Getenv("DBSYNC_DEBUG_RETRIES") == "1" {
+		retryDebug = true
+	}
+
 	// Initialize rate limiter & retry count based on flags
 	globalLimiter = newRateLimiter(*flagMaxQPS)
 	maxRetries = *flagMaxRetries
@@ -632,11 +638,26 @@ func uploadFile(client files.Client, remoteRoot string, lf *syncLocalFile, progr
 	upArg.Mute = true
 
 	if lf.Size <= largeFileThreshold {
-		// Stream small file directly instead of buffering whole file
-		pr := &progressReader{r: f, fn: progress}
+		// Read entire small file into memory so each retry can resend from the start.
+		// Previous streaming approach could cause retries to send only the remaining bytes (file handle advanced),
+		// resulting in truncated remote files and subsequent "leftover" uploads on the next run.
+		data, rerr := io.ReadAll(f)
+		if rerr != nil {
+			return rerr
+		}
+		reported := false
 		return doDropbox(func() error {
-			_, err = client.Upload(upArg, pr)
-			return err
+			// Fresh reader every attempt
+			reader := bytes.NewReader(data)
+			if retryDebug && reported { // indicate retry for this file
+				fmt.Printf("[retry-upload] reattempting %s (%d bytes)\n", lf.RelPath, lf.Size)
+			}
+			_, uerr := client.Upload(upArg, reader)
+			if uerr == nil && !reported && progress != nil {
+				progress(lf.Size) // count bytes once on success
+				reported = true
+			}
+			return uerr
 		})
 	}
 	// Large file: manual session
@@ -777,20 +798,6 @@ func deleteFile(client files.Client, dropboxPath string) error {
 
 // --- Rate limiting & retry helpers ---
 
-// progressReader streams data while reporting byte deltas.
-type progressReader struct {
-	r  io.Reader
-	fn func(int64)
-}
-
-func (p *progressReader) Read(b []byte) (int, error) {
-	n, err := p.r.Read(b)
-	if n > 0 && p.fn != nil {
-		p.fn(int64(n))
-	}
-	return n, err
-}
-
 type rateLimiter struct {
 	ch        <-chan time.Time
 	unlimited bool
@@ -817,6 +824,8 @@ func (rl *rateLimiter) Wait() {
 var (
 	globalLimiter *rateLimiter
 	maxRetries    int
+	verbose       bool
+	retryDebug    bool // enables retry attempt logging (set by -v or DBSYNC_DEBUG_RETRIES=1)
 )
 
 // Initialize limiter & retry settings once main has parsed flags.
@@ -841,17 +850,32 @@ func doDropbox(op func() error) error {
 		}
 		lastErr = op()
 		if lastErr == nil {
+			if retryDebug && i > 0 {
+				fmt.Printf("[retry] success after %d attempt(s)\n", i+1)
+			}
 			return nil
 		}
 		if !isTransientError(lastErr) {
+			if retryDebug && i > 0 {
+				fmt.Printf("[retry] giving up (non-transient) after %d attempt(s): %v\n", i+1, lastErr)
+			}
 			return lastErr
+		}
+		if retryDebug {
+			fmt.Printf("[retry] transient error attempt %d/%d: %v\n", i+1, attempts, lastErr)
 		}
 		sleep := base << i
 		if sleep > 8*time.Second {
 			sleep = 8 * time.Second
 		}
 		jitter := time.Duration(rand.Int63n(int64(100 * time.Millisecond)))
+		if retryDebug {
+			fmt.Printf("[retry] sleeping %s before next attempt\n", sleep+jitter)
+		}
 		time.Sleep(sleep + jitter)
+	}
+	if retryDebug {
+		fmt.Printf("[retry] exhausted %d attempts, last error: %v\n", attempts, lastErr)
 	}
 	return lastErr
 }
@@ -863,6 +887,9 @@ func isTransientError(err error) bool {
 	}
 	l := strings.ToLower(err.Error())
 	if strings.Contains(l, "too_many_requests") ||
+		strings.Contains(l, "too_many_write_operations") || // Dropbox write saturation
+		strings.Contains(l, "too_many_write_requests") || // possible variant wording
+		strings.Contains(l, "write operations") && strings.Contains(l, "too many") ||
 		(strings.Contains(l, "rate") && strings.Contains(l, "limit")) ||
 		strings.Contains(l, "timeout") ||
 		strings.Contains(l, "temporar") || // temporary / temporarily
