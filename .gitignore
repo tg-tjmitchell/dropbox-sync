@@ -43,3 +43,5 @@ _workspace/
 # Test cache and coverage
 coverage.out
 *.test
+
+test.json
