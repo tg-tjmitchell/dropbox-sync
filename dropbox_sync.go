@@ -353,6 +353,11 @@ func main() {
 				defer ticker.Stop()
 				printed := false
 				lines := *flagWorkers + 1 // total summary + per worker lines
+				// last sample snapshot for instantaneous rate calculations
+				lastSampleTime := startBar
+				var lastBytesDone int64
+				var lastBytesUploaded int64
+				var lastBytesDownloaded int64
 				render := func(final bool) {
 					comp := atomic.LoadInt64(&completed)
 					pct := float64(comp) / float64(total)
@@ -364,17 +369,29 @@ func main() {
 						filled = width
 					}
 					bar := strings.Repeat("#", filled) + strings.Repeat("-", width-filled)
-					elapsed := time.Since(startBar)
-					rate := float64(comp) / maxFloat(elapsed.Seconds(), 0.001)
+					now := time.Now()
+					elapsed := now.Sub(startBar)
+					interval := now.Sub(lastSampleTime)
+					if interval <= 0 {
+						interval = time.Millisecond
+					}
+					// Lifetime totals
 					bytesNow := atomic.LoadInt64(&bytesDone)
 					uNow := atomic.LoadInt64(&bytesUploaded)
 					dNow := atomic.LoadInt64(&bytesDownloaded)
-					totalRate := humanRate(float64(bytesNow) / maxFloat(elapsed.Seconds(), 0.001))
-					upRate := humanRate(float64(uNow) / maxFloat(elapsed.Seconds(), 0.001))
-					downRate := humanRate(float64(dNow) / maxFloat(elapsed.Seconds(), 0.001))
+					// Deltas since last tick
+					deltaTotal := bytesNow - lastBytesDone
+					deltaUp := uNow - lastBytesUploaded
+					deltaDown := dNow - lastBytesDownloaded
+					// Instantaneous (per second) rates
+					totalRate := humanRate(float64(deltaTotal) / maxFloat(interval.Seconds(), 0.001))
+					upRate := humanRate(float64(deltaUp) / maxFloat(interval.Seconds(), 0.001))
+					downRate := humanRate(float64(deltaDown) / maxFloat(interval.Seconds(), 0.001))
+					// For ETA, still use average completed tasks per total elapsed time
+					rateTasks := float64(comp) / maxFloat(elapsed.Seconds(), 0.001)
 					var etaStr string
 					if comp > 0 && comp < int64(total) {
-						remaining := float64(int64(total)-comp) / rate
+						remaining := float64(int64(total)-comp) / rateTasks
 						etaStr = formatDuration(time.Duration(remaining * float64(time.Second)))
 					} else {
 						etaStr = "0s"
@@ -402,6 +419,11 @@ func main() {
 						}
 						fmt.Printf(" W%02d | T:%3d U:%8s D:%8s | %s\n", i+1, tsks, humanBytes(u), humanBytes(dl), cur)
 					}
+					// update last sample snapshot (after printing to avoid bias)
+					lastSampleTime = now
+					lastBytesDone = bytesNow
+					lastBytesUploaded = uNow
+					lastBytesDownloaded = dNow
 					if final {
 						fmt.Print("\033[0m")
 					}
@@ -421,16 +443,29 @@ func main() {
 				startBar := time.Now()
 				ticker := time.NewTicker(500 * time.Millisecond)
 				defer ticker.Stop()
+				lastSampleTime := startBar
+				var lastBytesDone int64
+				var lastBytesUploaded int64
+				var lastBytesDownloaded int64
 				render := func(final bool) {
 					comp := atomic.LoadInt64(&completed)
 					pct := float64(comp) / maxFloat(float64(total), 1)
 					if pct > 1 {
 						pct = 1
 					}
-					elapsed := time.Since(startBar)
+					now := time.Now()
+					elapsed := now.Sub(startBar)
+					interval := now.Sub(lastSampleTime)
+					if interval <= 0 { interval = time.Millisecond }
 					bytesNow := atomic.LoadInt64(&bytesDone)
 					uNow := atomic.LoadInt64(&bytesUploaded)
 					dNow := atomic.LoadInt64(&bytesDownloaded)
+					deltaTotal := bytesNow - lastBytesDone
+					deltaUp := uNow - lastBytesUploaded
+					deltaDown := dNow - lastBytesDownloaded
+					upRate := humanRate(float64(deltaUp) / maxFloat(interval.Seconds(), 0.001))
+					downRate := humanRate(float64(deltaDown) / maxFloat(interval.Seconds(), 0.001))
+					instTotalRate := humanRate(float64(deltaTotal) / maxFloat(interval.Seconds(), 0.001))
 					var etaStr string
 					if comp > 0 && comp < int64(total) {
 						r := float64(int64(total)-comp) / (float64(comp) / maxFloat(elapsed.Seconds(), 0.001))
@@ -438,7 +473,11 @@ func main() {
 					} else {
 						etaStr = "0s"
 					}
-					fmt.Printf("\r%5.1f%% %d/%d | %s/%s U:%s D:%s ETA %s Elap %s        ", pct*100, comp, total, humanBytes(bytesNow), humanBytes(totalBytes), humanBytes(uNow), humanBytes(dNow), etaStr, formatDuration(elapsed))
+					fmt.Printf("\r%5.1f%% %d/%d | %s/%s TotRate:%s U:%s(%s) D:%s(%s) ETA %s Elap %s        ", pct*100, comp, total, humanBytes(bytesNow), humanBytes(totalBytes), instTotalRate, humanBytes(uNow), upRate, humanBytes(dNow), downRate, etaStr, formatDuration(elapsed))
+					lastSampleTime = now
+					lastBytesDone = bytesNow
+					lastBytesUploaded = uNow
+					lastBytesDownloaded = dNow
 					if final {
 						fmt.Print("\n")
 					}
