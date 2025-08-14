@@ -60,12 +60,13 @@ type task struct {
 
 // configFileModel models the JSON config file format.
 type configFileModel struct {
-	AccessToken  string `json:"access_token"`
-	LocalFolder  string `json:"local_folder"`
-	RemoteFolder string `json:"remote_folder"`
-	Delete       *bool  `json:"delete,omitempty"`
-	Download     *bool  `json:"download,omitempty"`
-	Workers      *int   `json:"workers,omitempty"`
+	AccessToken  string  `json:"access_token"`
+	LocalFolder  string  `json:"local_folder"`
+	RemoteFolder string  `json:"remote_folder"`
+	Delete       *bool   `json:"delete,omitempty"`
+	Download     *bool   `json:"download,omitempty"`
+	Mode         *string `json:"mode,omitempty"`
+	Workers      *int    `json:"workers,omitempty"`
 }
 
 func main() {
@@ -77,6 +78,7 @@ func main() {
 		flagRemote    = flag.String("remote", os.Getenv("DBSYNC_REMOTE_FOLDER"), "Dropbox folder starting with '/' (env DBSYNC_REMOTE_FOLDER / DROPBOX_FOLDER)")
 		flagDelete    = flag.Bool("delete", false, "Delete remote files not present locally")
 		flagDownload  = flag.Bool("download", false, "Download remote files missing locally or where remote copy is newer")
+		flagMode      = flag.String("mode", "", "Sync mode: upload|download|two-way|mirror (overrides --delete/--download)")
 		flagWorkers   = flag.Int("workers", minInt(8, runtime.NumCPU()*2), "Parallel worker count")
 		flagDryRun    = flag.Bool("dry-run", false, "Show actions without executing")
 		flagVerbose   = flag.Bool("v", false, "Verbose logging")
@@ -110,6 +112,9 @@ func main() {
 		if cfg.Download != nil && !flagPassed("download") {
 			*flagDownload = *cfg.Download
 		}
+		if cfg.Mode != nil && !flagPassed("mode") {
+			*flagMode = *cfg.Mode
+		}
 		if cfg.Workers != nil && !flagPassed("workers") {
 			*flagWorkers = *cfg.Workers
 		}
@@ -132,6 +137,9 @@ func main() {
 				}
 				if cfg.Download != nil && !flagPassed("download") {
 					*flagDownload = *cfg.Download
+				}
+				if cfg.Mode != nil && !flagPassed("mode") {
+					*flagMode = *cfg.Mode
 				}
 				if cfg.Workers != nil && !flagPassed("workers") {
 					*flagWorkers = *cfg.Workers
@@ -164,21 +172,44 @@ func main() {
 	remoteFiles := collectRemoteEntries(client, *flagRemote)
 	fmt.Printf("Found %d remote files.\n", len(remoteFiles))
 
+	// Apply mode (if provided) to normalize delete/download flags and decide if uploads are skipped
+	skipUploads := false
+	if *flagMode != "" {
+		switch strings.ToLower(*flagMode) {
+		case "upload":
+			*flagDownload = false
+			*flagDelete = false
+		case "download":
+			*flagDownload = true
+			*flagDelete = false
+			skipUploads = true
+		case "two-way", "twoway", "two_way":
+			*flagDownload = true
+			*flagDelete = false
+		case "mirror":
+			*flagDownload = true
+			*flagDelete = true
+		default:
+			log.Fatalf("invalid --mode value: %s", *flagMode)
+		}
+	}
+
 	// Determine operations
 	uploads := []*syncLocalFile{}
 	deletes := []string{}
 	downloads := []string{}
 
-	for _, lf := range localFiles { // Upload new or modified
-		rf, exists := remoteFiles[lf.RelPath]
-		if !exists {
-			uploads = append(uploads, lf)
-			continue
-		}
-		// compare mod times (clientModified is remote's stored local time in Dropbox) - treat as UTC
-		remoteTime := rf.ClientModified
-		if lf.MTime.Sub(remoteTime).Seconds() > mtimeSkewSeconds { // local newer
-			uploads = append(uploads, lf)
+	if !skipUploads {
+		for _, lf := range localFiles { // Upload new or modified
+			rf, exists := remoteFiles[lf.RelPath]
+			if !exists {
+				uploads = append(uploads, lf)
+				continue
+			}
+			remoteTime := rf.ClientModified
+			if lf.MTime.Sub(remoteTime).Seconds() > mtimeSkewSeconds { // local newer
+				uploads = append(uploads, lf)
+			}
 		}
 	}
 
@@ -212,7 +243,11 @@ func main() {
 		}
 	}
 
-	fmt.Printf("Planned uploads/updates: %d\n", len(uploads))
+	if skipUploads {
+		fmt.Printf("Uploads disabled by mode (%s)\n", *flagMode)
+	} else {
+		fmt.Printf("Planned uploads/updates: %d\n", len(uploads))
+	}
 	if *flagDelete {
 		fmt.Printf("Planned deletions: %d\n", len(deletes))
 	} else {
@@ -251,8 +286,14 @@ func main() {
 	var completed int64
 	var bytesDone int64
 	var totalBytes int64
-	for _, u := range uploads { totalBytes += u.Size }
-	for _, rel := range downloads { if rf, ok := remoteFiles[rel]; ok { totalBytes += rf.Size } }
+	for _, u := range uploads {
+		totalBytes += u.Size
+	}
+	for _, rel := range downloads {
+		if rf, ok := remoteFiles[rel]; ok {
+			totalBytes += rf.Size
+		}
+	}
 
 	showProgress := !*flagNoProgBar && !*flagVerbose && totalTasks > 0
 	doneCh := make(chan struct{})
@@ -323,8 +364,14 @@ func main() {
 					mu.Unlock()
 				}
 			case taskDownload:
-				if *flagVerbose { fmt.Printf("[worker %d] downloading %s\n", id, t.Rel) }
-				if err := downloadFile(client, t.RemotePath, *flagLocal, t.Rel, t.Remote, func(delta int64) { if delta > 0 { atomic.AddInt64(&bytesDone, delta) } }); err != nil {
+				if *flagVerbose {
+					fmt.Printf("[worker %d] downloading %s\n", id, t.Rel)
+				}
+				if err := downloadFile(client, t.RemotePath, *flagLocal, t.Rel, t.Remote, func(delta int64) {
+					if delta > 0 {
+						atomic.AddInt64(&bytesDone, delta)
+					}
+				}); err != nil {
 					mu.Lock()
 					errorsFound = append(errorsFound, fmt.Errorf("download %s: %w", t.Rel, err))
 					mu.Unlock()
@@ -566,40 +613,56 @@ func uploadFile(client files.Client, remoteRoot string, lf *syncLocalFile, progr
 func downloadFile(client files.Client, remotePath string, localRoot string, rel string, rf *syncRemoteFile, progress func(delta int64)) error {
 	// Use Download API
 	arg := files.NewDownloadArg(remotePath)
- 	res, content, err := client.Download(arg)
- 	if err != nil {
- 		return err
- 	}
- 	defer content.Close()
- 	// Ensure destination directory exists
- 	localPath := filepath.Join(localRoot, filepath.FromSlash(rel))
- 	if err := os.MkdirAll(filepath.Dir(localPath), 0o755); err != nil { return err }
- 	f, err := os.Create(localPath)
- 	if err != nil { return err }
- 	defer f.Close()
- 	// Stream copy in chunks to report progress
- 	buf := make([]byte, 64*1024)
- 	var written int64
- 	for {
- 		n, rerr := content.Read(buf)
- 		if n > 0 {
- 			wn, werr := f.Write(buf[:n])
- 			written += int64(wn)
- 			if progress != nil { progress(int64(wn)) }
- 			if werr != nil { return werr }
- 		}
- 		if rerr != nil {
- 			if errors.Is(rerr, io.EOF) { break }
- 			return rerr
- 		}
- 	}
- 	// Set mod time to remote client modified (prefer rf if provided, else res)
- 	var modTime time.Time
- 	if rf != nil { modTime = rf.ClientModified } else if res != nil { modTime = res.ClientModified } else { modTime = time.Now().UTC() }
- 	if !modTime.IsZero() {
- 		_ = os.Chtimes(localPath, time.Now(), modTime)
- 	}
- 	return nil
+	res, content, err := client.Download(arg)
+	if err != nil {
+		return err
+	}
+	defer content.Close()
+	// Ensure destination directory exists
+	localPath := filepath.Join(localRoot, filepath.FromSlash(rel))
+	if err := os.MkdirAll(filepath.Dir(localPath), 0o755); err != nil {
+		return err
+	}
+	f, err := os.Create(localPath)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	// Stream copy in chunks to report progress
+	buf := make([]byte, 64*1024)
+	var written int64
+	for {
+		n, rerr := content.Read(buf)
+		if n > 0 {
+			wn, werr := f.Write(buf[:n])
+			written += int64(wn)
+			if progress != nil {
+				progress(int64(wn))
+			}
+			if werr != nil {
+				return werr
+			}
+		}
+		if rerr != nil {
+			if errors.Is(rerr, io.EOF) {
+				break
+			}
+			return rerr
+		}
+	}
+	// Set mod time to remote client modified (prefer rf if provided, else res)
+	var modTime time.Time
+	if rf != nil {
+		modTime = rf.ClientModified
+	} else if res != nil {
+		modTime = res.ClientModified
+	} else {
+		modTime = time.Now().UTC()
+	}
+	if !modTime.IsZero() {
+		_ = os.Chtimes(localPath, time.Now(), modTime)
+	}
+	return nil
 }
 
 // deleteFile deletes a single remote path

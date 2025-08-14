@@ -22,6 +22,8 @@ The program accepts configuration from (in order of precedence): command-line fl
 		"local_folder": "C:/path/to/local/folder",
 		"remote_folder": "/Apps/MyApp/Folder",
 		"delete": false,
+		"download": false,
+		"mode": "two-way",
 		"workers": 8
 	}
 
@@ -29,7 +31,9 @@ Fields:
 - `access_token` (string) — Dropbox access token.
 - `local_folder` (string) — path to the local folder to sync.
 - `remote_folder` (string) — Dropbox folder path (must start with `/`).
-- `delete` (bool, optional) — whether to delete remote files not present locally.
+- `delete` (bool, optional) — delete remote files not present locally (one‑way mirror behavior when enabled).
+- `download` (bool, optional) — enable downloading remote files that are missing locally or whose remote copy is newer.
+- `mode` (string, optional) — alternative to separate flags: `upload`, `download`, `two-way`, `mirror`.
 - `workers` (int, optional) — number of parallel workers.
 
 ## Environment variables
@@ -49,6 +53,8 @@ Important flags the program accepts:
 - `--local` : Local folder path (overrides env & config)
 - `--remote` : Remote Dropbox folder (must start with `/`, overrides env & config)
 - `--delete` : Enable deletions of remote files not present locally
+- `--download` : Enable downloading remote files missing locally or whose remote copy is newer
+- `--mode` : Combined directional modes: upload|download|two-way|mirror (overrides --delete/--download)
 - `--workers` : Number of parallel workers (defaults to min(8, CPU*2))
 - `--dry-run` : Show actions without uploading/deleting
 - `-v` : Verbose logging
@@ -106,23 +112,23 @@ Typical workflows:
 	```
 
 Notes:
-- The remote folder must start with a leading slash (`/`).
-- Use `--dry-run` first to verify planned uploads/deletes without making changes.
-- Use `--delete` to enable removing remote files that no longer exist locally.
+- Remote folder must start with `/`.
+- Use `--dry-run` first to preview actions.
+- `--delete` removes remote files not present locally.
+- `--download` also pulls missing or newer remote files locally.
 
 ## Examples
 
-- Dry run with config file:
+```powershell
+# Dry run
+.\dropbox-sync.exe --config .\dropbox-sync.json --dry-run
 
-	```powershell
-	.\dropbox-sync.exe --config .\dropbox-sync.json --dry-run
-	```
+# Real run with deletions enabled
+.\dropbox-sync.exe --config .\dropbox-sync.json --delete
 
-- Real run with 16 workers and deletions enabled:
-
-	```powershell
-	.\dropbox-sync.exe --config .\dropbox-sync.json --workers 16 --delete
-	```
+# Two-way (adds remote downloads of newer/missing files)
+.\dropbox-sync.exe --config .\dropbox-sync.json --download
+```
 
 ## Troubleshooting
 
