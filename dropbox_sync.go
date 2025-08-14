@@ -439,7 +439,11 @@ func collectLocalEntries(root string) map[string]*syncLocalFile {
 			return err
 		}
 		rel = filepath.ToSlash(rel)
-		out[rel] = &syncLocalFile{RelPath: rel, FullPath: path, Size: info.Size(), MTime: info.ModTime().UTC()}
+		// Dropbox API for client_modified expects format '%Y-%m-%dT%H:%M:%SZ' (no fractional seconds).
+		// Truncate to whole seconds to avoid errors like:
+		// client_modified: time data '2025-08-08T19:44:20.0943023Z' does not match format '%Y-%m-%dT%H:%M:%SZ'
+		mtime := info.ModTime().UTC().Truncate(time.Second)
+		out[rel] = &syncLocalFile{RelPath: rel, FullPath: path, Size: info.Size(), MTime: mtime}
 		return nil
 	})
 	return out
