@@ -316,7 +316,9 @@ func main() {
 	var mu sync.Mutex
 	errorsFound := []error{}
 	var completed int64
-	var bytesDone int64
+	var bytesDone int64            // total bytes (uploads + downloads)
+	var bytesUploaded int64        // bytes uploaded
+	var bytesDownloaded int64      // bytes downloaded
 	var totalBytes int64
 	for _, u := range uploads {
 		totalBytes += u.Size
@@ -345,6 +347,23 @@ func main() {
 				elapsed := time.Since(startBar)
 				rate := float64(comp) / elapsed.Seconds()
 				bytesNow := atomic.LoadInt64(&bytesDone)
+				uNow := atomic.LoadInt64(&bytesUploaded)
+				dNow := atomic.LoadInt64(&bytesDownloaded)
+				var bpsStr string
+				if elapsed > 0 {
+					bps := float64(bytesNow) / elapsed.Seconds()
+					bpsStr = humanRate(bps)
+				} else {
+					bpsStr = "0B/s"
+				}
+				var upRateStr, downRateStr string
+				if elapsed > 0 {
+					upRateStr = humanRate(float64(uNow) / elapsed.Seconds())
+					downRateStr = humanRate(float64(dNow) / elapsed.Seconds())
+				} else {
+					upRateStr = "0B/s"
+					downRateStr = "0B/s"
+				}
 				var etaStr string
 				if comp > 0 && comp < int64(total) {
 					remaining := float64(int64(total)-comp) / rate
@@ -352,7 +371,7 @@ func main() {
 				} else {
 					etaStr = "0s"
 				}
-				fmt.Printf("\r[%s] %5.1f%% %d/%d | %s/%s | %.2f f/s | ETA %s Elapsed %s", bar, pct*100, comp, total, humanBytes(bytesNow), humanBytes(totalBytes), rate, etaStr, formatDuration(elapsed))
+				fmt.Printf("\r[%s] %5.1f%% %d/%d | %s/%s (U:%s %s D:%s %s) | %s total | %.2f f/s | ETA %s Elapsed %s", bar, pct*100, comp, total, humanBytes(bytesNow), humanBytes(totalBytes), humanBytes(uNow), upRateStr, humanBytes(dNow), downRateStr, bpsStr, rate, etaStr, formatDuration(elapsed))
 				if final {
 					fmt.Println()
 				}
@@ -379,6 +398,7 @@ func main() {
 				}
 				if err := uploadFile(client, *flagRemote, t.Local, func(delta int64) {
 					if delta > 0 {
+						atomic.AddInt64(&bytesUploaded, delta)
 						atomic.AddInt64(&bytesDone, delta)
 					}
 				}); err != nil {
@@ -401,6 +421,7 @@ func main() {
 				}
 				if err := downloadFile(client, t.RemotePath, *flagLocal, t.Rel, t.Remote, func(delta int64) {
 					if delta > 0 {
+						atomic.AddInt64(&bytesDownloaded, delta)
 						atomic.AddInt64(&bytesDone, delta)
 					}
 				}); err != nil {
@@ -916,6 +937,23 @@ func humanBytes(n int64) string {
 		exp++
 	}
 	return fmt.Sprintf("%.1f%ciB", float64(n)/float64(div), "KMGTPE"[exp])
+}
+
+// humanRate converts a bytes/sec float into a human readable rate string (e.g., 12.3MiB/s)
+func humanRate(bps float64) string {
+	if bps <= 0 {
+		return "0B/s"
+	}
+	const unit = 1024.0
+	if bps < unit {
+		return fmt.Sprintf("%.0fB/s", bps)
+	}
+	div, exp := unit, 0
+	for m := bps / unit; m >= unit; m /= unit {
+		div *= unit
+		exp++
+	}
+	return fmt.Sprintf("%.1f%ciB/s", bps/div, "KMGTPE"[exp])
 }
 
 // formatDuration shortens durations (e.g., 1h2m3s)
