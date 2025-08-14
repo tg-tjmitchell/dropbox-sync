@@ -59,6 +59,14 @@ type task struct {
 	Rel        string          // relative path for downloads/logging
 }
 
+// workerStats holds per-worker progress metrics
+type workerStats struct {
+	uploaded  int64         // bytes uploaded by this worker
+	downloaded int64        // bytes downloaded by this worker
+	tasks     int64         // tasks completed
+	current   atomic.Value  // string: current file rel path
+}
+
 // configFileModel models the JSON config file format.
 type configFileModel struct {
 	AccessToken  string  `json:"access_token"`
@@ -319,6 +327,10 @@ func main() {
 	var bytesDone int64            // total bytes (uploads + downloads)
 	var bytesUploaded int64        // bytes uploaded
 	var bytesDownloaded int64      // bytes downloaded
+	perWorker := make([]*workerStats, *flagWorkers)
+	for i := 0; i < *flagWorkers; i++ {
+		perWorker[i] = &workerStats{}
+	}
 	var totalBytes int64
 	for _, u := range uploads {
 		totalBytes += u.Size
@@ -334,36 +346,29 @@ func main() {
 	if showProgress {
 		go func(total int, totalBytes int64, width int) {
 			startBar := time.Now()
-			ticker := time.NewTicker(120 * time.Millisecond)
+			ticker := time.NewTicker(200 * time.Millisecond)
 			defer ticker.Stop()
+			printed := false
+			lines := *flagWorkers + 1 // total summary + per worker lines
 			render := func(final bool) {
 				comp := atomic.LoadInt64(&completed)
 				pct := float64(comp) / float64(total)
+				if pct > 1 {
+					pct = 1
+				}
 				filled := int(pct * float64(width))
 				if filled > width {
 					filled = width
 				}
 				bar := strings.Repeat("#", filled) + strings.Repeat("-", width-filled)
 				elapsed := time.Since(startBar)
-				rate := float64(comp) / elapsed.Seconds()
+				rate := float64(comp) / maxFloat(elapsed.Seconds(), 0.001)
 				bytesNow := atomic.LoadInt64(&bytesDone)
 				uNow := atomic.LoadInt64(&bytesUploaded)
 				dNow := atomic.LoadInt64(&bytesDownloaded)
-				var bpsStr string
-				if elapsed > 0 {
-					bps := float64(bytesNow) / elapsed.Seconds()
-					bpsStr = humanRate(bps)
-				} else {
-					bpsStr = "0B/s"
-				}
-				var upRateStr, downRateStr string
-				if elapsed > 0 {
-					upRateStr = humanRate(float64(uNow) / elapsed.Seconds())
-					downRateStr = humanRate(float64(dNow) / elapsed.Seconds())
-				} else {
-					upRateStr = "0B/s"
-					downRateStr = "0B/s"
-				}
+				totalRate := humanRate(float64(bytesNow) / maxFloat(elapsed.Seconds(), 0.001))
+				upRate := humanRate(float64(uNow) / maxFloat(elapsed.Seconds(), 0.001))
+				downRate := humanRate(float64(dNow) / maxFloat(elapsed.Seconds(), 0.001))
 				var etaStr string
 				if comp > 0 && comp < int64(total) {
 					remaining := float64(int64(total)-comp) / rate
@@ -371,9 +376,31 @@ func main() {
 				} else {
 					etaStr = "0s"
 				}
-				fmt.Printf("\r[%s] %5.1f%% %d/%d | %s/%s (U:%s %s D:%s %s) | %s total | %.2f f/s | ETA %s Elapsed %s", bar, pct*100, comp, total, humanBytes(bytesNow), humanBytes(totalBytes), humanBytes(uNow), upRateStr, humanBytes(dNow), downRateStr, bpsStr, rate, etaStr, formatDuration(elapsed))
+				if printed {
+					// move cursor up to redraw block
+					fmt.Printf("\033[%dA", lines)
+				} else {
+					printed = true
+				}
+				// Summary line
+				fmt.Printf("[%s] %5.1f%% %d/%d | %s/%s U:%s(%s) D:%s(%s) | %s | ETA %s Elap %s\n",
+					bar, pct*100, comp, total, humanBytes(bytesNow), humanBytes(totalBytes), humanBytes(uNow), upRate, humanBytes(dNow), downRate, totalRate, etaStr, formatDuration(elapsed))
+				// Per-worker lines
+				for i, st := range perWorker {
+					u := atomic.LoadInt64(&st.uploaded)
+					dl := atomic.LoadInt64(&st.downloaded)
+					tsks := atomic.LoadInt64(&st.tasks)
+					cur := ""
+					if v := st.current.Load(); v != nil {
+						cur, _ = v.(string)
+					}
+					if len(cur) > 50 {
+						cur = cur[:47] + "..."
+					}
+					fmt.Printf(" W%02d | T:%3d U:%8s D:%8s | %s\n", i+1, tsks, humanBytes(u), humanBytes(dl), cur)
+				}
 				if final {
-					fmt.Println()
+					fmt.Print("\033[0m")
 				}
 			}
 			for {
@@ -391,15 +418,18 @@ func main() {
 	worker := func(id int) {
 		defer wg.Done()
 		for t := range tasks {
+			st := perWorker[id-1]
 			switch t.Kind {
 			case taskUpload:
 				if *flagVerbose {
 					fmt.Printf("[worker %d] uploading %s\n", id, t.Local.RelPath)
 				}
+				st.current.Store(t.Local.RelPath)
 				if err := uploadFile(client, *flagRemote, t.Local, func(delta int64) {
 					if delta > 0 {
 						atomic.AddInt64(&bytesUploaded, delta)
 						atomic.AddInt64(&bytesDone, delta)
+						atomic.AddInt64(&st.uploaded, delta)
 					}
 				}); err != nil {
 					mu.Lock()
@@ -410,6 +440,7 @@ func main() {
 				if *flagVerbose {
 					fmt.Printf("[worker %d] deleting %s\n", id, t.RemotePath)
 				}
+				st.current.Store(t.RemotePath)
 				if err := deleteFile(client, t.RemotePath); err != nil {
 					mu.Lock()
 					errorsFound = append(errorsFound, fmt.Errorf("delete %s: %w", t.RemotePath, err))
@@ -419,10 +450,12 @@ func main() {
 				if *flagVerbose {
 					fmt.Printf("[worker %d] downloading %s\n", id, t.Rel)
 				}
+				st.current.Store(t.Rel)
 				if err := downloadFile(client, t.RemotePath, *flagLocal, t.Rel, t.Remote, func(delta int64) {
 					if delta > 0 {
 						atomic.AddInt64(&bytesDownloaded, delta)
 						atomic.AddInt64(&bytesDone, delta)
+						atomic.AddInt64(&st.downloaded, delta)
 					}
 				}); err != nil {
 					mu.Lock()
@@ -430,6 +463,7 @@ func main() {
 					mu.Unlock()
 				}
 			}
+			atomic.AddInt64(&st.tasks, 1)
 			if showProgress {
 				atomic.AddInt64(&completed, 1)
 			}
@@ -973,4 +1007,9 @@ func formatDuration(d time.Duration) string {
 		return fmt.Sprintf("%dm%ds", mins, secs)
 	}
 	return fmt.Sprintf("%ds", secs)
+}
+
+func maxFloat(a, b float64) float64 {
+	if a > b { return a }
+	return b
 }
