@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"math/rand"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -72,23 +73,29 @@ type configFileModel struct {
 func main() {
 	// --- Flags & Configuration ---
 	var (
-		flagConfig    = flag.String("config", "", "Path to JSON config file (used if flags/env missing)")
-		flagToken     = flag.String("token", "", "Dropbox access token (overrides env & config)")
-		flagLocal     = flag.String("local", os.Getenv("DBSYNC_LOCAL_FOLDER"), "Local folder (env DBSYNC_LOCAL_FOLDER / LOCAL_FOLDER)")
-		flagRemote    = flag.String("remote", os.Getenv("DBSYNC_REMOTE_FOLDER"), "Dropbox folder starting with '/' (env DBSYNC_REMOTE_FOLDER / DROPBOX_FOLDER)")
-		flagDelete    = flag.Bool("delete", false, "Delete remote files not present locally")
-		flagDownload  = flag.Bool("download", false, "Download remote files missing locally or where remote copy is newer")
-		flagMode      = flag.String("mode", "", "Sync mode: upload|download|two-way|mirror (overrides --delete/--download)")
-		flagWorkers   = flag.Int("workers", minInt(8, runtime.NumCPU()*2), "Parallel worker count")
-		flagDryRun    = flag.Bool("dry-run", false, "Show actions without executing")
-		flagVerbose   = flag.Bool("v", false, "Verbose logging")
-		flagNoProgBar = flag.Bool("no-progress", false, "Disable progress bar output (auto disabled with -v)")
-		flagBarWidth  = flag.Int("bar-width", 40, "Progress bar width (characters)")
+		flagConfig     = flag.String("config", "", "Path to JSON config file (used if flags/env missing)")
+		flagToken      = flag.String("token", "", "Dropbox access token (overrides env & config)")
+		flagLocal      = flag.String("local", os.Getenv("DBSYNC_LOCAL_FOLDER"), "Local folder (env DBSYNC_LOCAL_FOLDER / LOCAL_FOLDER)")
+		flagRemote     = flag.String("remote", os.Getenv("DBSYNC_REMOTE_FOLDER"), "Dropbox folder starting with '/' (env DBSYNC_REMOTE_FOLDER / DROPBOX_FOLDER)")
+		flagDelete     = flag.Bool("delete", false, "Delete remote files not present locally")
+		flagDownload   = flag.Bool("download", false, "Download remote files missing locally or where remote copy is newer")
+		flagMode       = flag.String("mode", "", "Sync mode: upload|download|two-way|mirror (overrides --delete/--download)")
+		flagWorkers    = flag.Int("workers", minInt(8, runtime.NumCPU()*2), "Parallel worker count")
+		flagDryRun     = flag.Bool("dry-run", false, "Show actions without executing")
+		flagVerbose    = flag.Bool("v", false, "Verbose logging")
+		flagNoProgBar  = flag.Bool("no-progress", false, "Disable progress bar output (auto disabled with -v)")
+		flagBarWidth   = flag.Int("bar-width", 40, "Progress bar width (characters)")
+		flagMaxQPS     = flag.Int("max-qps", 10, "Max Dropbox API calls per second (0 = unlimited)")
+		flagMaxRetries = flag.Int("max-retries", 6, "Max retry attempts for transient Dropbox errors")
 	)
 	flag.Parse()
 	// Resolve configuration order: flags > env vars > config file
 	// Added flag for automatic remote folder creation when missing
 	flagAutoCreate := flag.Bool("auto-create-remote", true, "Automatically create remote Dropbox folder path if missing")
+
+	// Initialize rate limiter & retry count based on flags
+	globalLimiter = newRateLimiter(*flagMaxQPS)
+	maxRetries = *flagMaxRetries
 
 	token := firstNonEmpty(*flagToken,
 		os.Getenv("DBSYNC_ACCESS_TOKEN"),
@@ -225,7 +232,8 @@ func main() {
 				continue
 			}
 			remoteTime := rf.ClientModified
-			if lf.MTime.Sub(remoteTime).Seconds() > mtimeSkewSeconds { // local newer
+			// Upload if local newer OR sizes differ (even if clock skew is small)
+			if lf.MTime.Sub(remoteTime).Seconds() > mtimeSkewSeconds || lf.Size != rf.Size {
 				uploads = append(uploads, lf)
 			}
 		}
@@ -624,26 +632,28 @@ func uploadFile(client files.Client, remoteRoot string, lf *syncLocalFile, progr
 	upArg.Mute = true
 
 	if lf.Size <= largeFileThreshold {
-		// Wrap reader to count bytes (single increment at end if small)
-		data, errRead := io.ReadAll(f)
-		if errRead != nil {
-			return errRead
-		}
-		_, err = client.Upload(upArg, bytes.NewReader(data))
-		if err == nil && progress != nil {
-			progress(lf.Size)
-		}
-		return err
+		// Stream small file directly instead of buffering whole file
+		pr := &progressReader{r: f, fn: progress}
+		return doDropbox(func() error {
+			_, err = client.Upload(upArg, pr)
+			return err
+		})
 	}
 	// Large file: manual session
 	// Start session
-	firstChunk := make([]byte, minInt(int(chunkSize), int(lf.Size)))
-	n, err := io.ReadFull(f, firstChunk)
+	bufSize := minInt(int(chunkSize), int(lf.Size))
+	buf := make([]byte, chunkSize) // allocate max chunk once; we may use a subset for first/last
+	n, err := io.ReadFull(f, buf[:bufSize])
 	if err != nil && !errors.Is(err, io.ErrUnexpectedEOF) {
 		return fmt.Errorf("read first chunk: %w", err)
 	}
 	startArg := files.NewUploadSessionStartArg()
-	startRes, err := client.UploadSessionStart(startArg, bytes.NewReader(firstChunk[:n]))
+	var startRes *files.UploadSessionStartResult
+	err = doDropbox(func() error {
+		var innerErr error
+		startRes, innerErr = client.UploadSessionStart(startArg, bytes.NewReader(buf[:n]))
+		return innerErr
+	})
 	if err != nil {
 		return fmt.Errorf("session start: %w", err)
 	}
@@ -658,8 +668,7 @@ func uploadFile(client files.Client, remoteRoot string, lf *syncLocalFile, progr
 		if remaining < thisChunk {
 			thisChunk = remaining
 		}
-		buf := make([]byte, thisChunk)
-		rn, err := io.ReadFull(f, buf)
+		rn, err := io.ReadFull(f, buf[:thisChunk])
 		if err != nil && !errors.Is(err, io.ErrUnexpectedEOF) {
 			return fmt.Errorf("read chunk: %w", err)
 		}
@@ -667,7 +676,7 @@ func uploadFile(client files.Client, remoteRoot string, lf *syncLocalFile, progr
 		cursor := files.NewUploadSessionCursor(startRes.SessionId, uint64(offset-int64(rn)))
 		if offset < lf.Size { // append
 			appendArg := files.NewUploadSessionAppendArg(cursor)
-			err = client.UploadSessionAppendV2(appendArg, bytes.NewReader(buf[:rn]))
+			err = doDropbox(func() error { return client.UploadSessionAppendV2(appendArg, bytes.NewReader(buf[:rn])) })
 			if err != nil {
 				return fmt.Errorf("session append: %w", err)
 			}
@@ -679,7 +688,10 @@ func uploadFile(client files.Client, remoteRoot string, lf *syncLocalFile, progr
 			commitInfo.ClientModified = &lf.MTime
 			commitInfo.Mode = &files.WriteMode{Tagged: dropbox.Tagged{Tag: "overwrite"}}
 			finishArg := files.NewUploadSessionFinishArg(cursor, commitInfo)
-			_, err = client.UploadSessionFinish(finishArg, bytes.NewReader(buf[:rn]))
+			err = doDropbox(func() error {
+				_, inner := client.UploadSessionFinish(finishArg, bytes.NewReader(buf[:rn]))
+				return inner
+			})
 			if err != nil {
 				return fmt.Errorf("session finish: %w", err)
 			}
@@ -695,7 +707,15 @@ func uploadFile(client files.Client, remoteRoot string, lf *syncLocalFile, progr
 func downloadFile(client files.Client, remotePath string, localRoot string, rel string, rf *syncRemoteFile, progress func(delta int64)) error {
 	// Use Download API
 	arg := files.NewDownloadArg(remotePath)
-	res, content, err := client.Download(arg)
+	var (
+		res     *files.FileMetadata
+		content io.ReadCloser
+	)
+	err := doDropbox(func() error {
+		var inner error
+		res, content, inner = client.Download(arg)
+		return inner
+	})
 	if err != nil {
 		return err
 	}
@@ -749,8 +769,111 @@ func downloadFile(client files.Client, remotePath string, localRoot string, rel 
 
 // deleteFile deletes a single remote path
 func deleteFile(client files.Client, dropboxPath string) error {
-	_, err := client.DeleteV2(files.NewDeleteArg(dropboxPath))
-	return err
+	return doDropbox(func() error {
+		_, err := client.DeleteV2(files.NewDeleteArg(dropboxPath))
+		return err
+	})
+}
+
+// --- Rate limiting & retry helpers ---
+
+// progressReader streams data while reporting byte deltas.
+type progressReader struct {
+	r  io.Reader
+	fn func(int64)
+}
+
+func (p *progressReader) Read(b []byte) (int, error) {
+	n, err := p.r.Read(b)
+	if n > 0 && p.fn != nil {
+		p.fn(int64(n))
+	}
+	return n, err
+}
+
+type rateLimiter struct {
+	ch        <-chan time.Time
+	unlimited bool
+}
+
+func newRateLimiter(qps int) *rateLimiter {
+	if qps <= 0 {
+		return &rateLimiter{unlimited: true}
+	}
+	interval := time.Second / time.Duration(qps)
+	if interval <= 0 {
+		interval = time.Millisecond
+	}
+	return &rateLimiter{ch: time.NewTicker(interval).C}
+}
+
+func (rl *rateLimiter) Wait() {
+	if rl == nil || rl.unlimited {
+		return
+	}
+	<-rl.ch
+}
+
+var (
+	globalLimiter *rateLimiter
+	maxRetries    int
+)
+
+// Initialize limiter & retry settings once main has parsed flags.
+func init() {
+	rand.Seed(time.Now().UnixNano())
+}
+
+// doDropbox applies rate limiting + retry for a Dropbox API operation.
+func doDropbox(op func() error) error {
+	if globalLimiter != nil {
+		globalLimiter.Wait()
+	}
+	attempts := maxRetries
+	if attempts <= 0 {
+		attempts = 1
+	}
+	var lastErr error
+	base := 250 * time.Millisecond
+	for i := 0; i < attempts; i++ {
+		if i > 0 && globalLimiter != nil { // wait again before retry to smooth bursts
+			globalLimiter.Wait()
+		}
+		lastErr = op()
+		if lastErr == nil {
+			return nil
+		}
+		if !isTransientError(lastErr) {
+			return lastErr
+		}
+		sleep := base << i
+		if sleep > 8*time.Second {
+			sleep = 8 * time.Second
+		}
+		jitter := time.Duration(rand.Int63n(int64(100 * time.Millisecond)))
+		time.Sleep(sleep + jitter)
+	}
+	return lastErr
+}
+
+// isTransientError performs broad substring checks for retriable conditions.
+func isTransientError(err error) bool {
+	if err == nil {
+		return false
+	}
+	l := strings.ToLower(err.Error())
+	if strings.Contains(l, "too_many_requests") ||
+		(strings.Contains(l, "rate") && strings.Contains(l, "limit")) ||
+		strings.Contains(l, "timeout") ||
+		strings.Contains(l, "temporar") || // temporary / temporarily
+		strings.Contains(l, "connect") ||
+		strings.Contains(l, "reset") ||
+		strings.Contains(l, "unavailable") ||
+		strings.Contains(l, "500") ||
+		strings.Contains(l, "503") {
+		return true
+	}
+	return false
 }
 
 // bytesReader returns an io.ReadCloser for a byte slice without copying
