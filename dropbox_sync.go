@@ -456,7 +456,9 @@ func main() {
 					now := time.Now()
 					elapsed := now.Sub(startBar)
 					interval := now.Sub(lastSampleTime)
-					if interval <= 0 { interval = time.Millisecond }
+					if interval <= 0 {
+						interval = time.Millisecond
+					}
 					bytesNow := atomic.LoadInt64(&bytesDone)
 					uNow := atomic.LoadInt64(&bytesUploaded)
 					dNow := atomic.LoadInt64(&bytesDownloaded)
