@@ -61,10 +61,10 @@ type task struct {
 
 // workerStats holds per-worker progress metrics
 type workerStats struct {
-	uploaded  int64         // bytes uploaded by this worker
+	uploaded   int64        // bytes uploaded by this worker
 	downloaded int64        // bytes downloaded by this worker
-	tasks     int64         // tasks completed
-	current   atomic.Value  // string: current file rel path
+	tasks      int64        // tasks completed
+	current    atomic.Value // string: current file rel path
 }
 
 // configFileModel models the JSON config file format.
@@ -324,9 +324,9 @@ func main() {
 	var mu sync.Mutex
 	errorsFound := []error{}
 	var completed int64
-	var bytesDone int64            // total bytes (uploads + downloads)
-	var bytesUploaded int64        // bytes uploaded
-	var bytesDownloaded int64      // bytes downloaded
+	var bytesDone int64       // total bytes (uploads + downloads)
+	var bytesUploaded int64   // bytes uploaded
+	var bytesDownloaded int64 // bytes downloaded
 	perWorker := make([]*workerStats, *flagWorkers)
 	for i := 0; i < *flagWorkers; i++ {
 		perWorker[i] = &workerStats{}
@@ -1010,6 +1010,8 @@ func formatDuration(d time.Duration) string {
 }
 
 func maxFloat(a, b float64) float64 {
-	if a > b { return a }
+	if a > b {
+		return a
+	}
 	return b
 }
